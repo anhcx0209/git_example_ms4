@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Thông tin cá nhân</title>
+	<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
+	<link rel="stylesheet" href="myInfor.css">
+</head>
+<style>
+	body {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: linear-gradient(-35deg, #ff9ff3, #feca57, #ff6b6b, #48dbfb, #1dd1a1);
+    background-size: 400% 400%;
+    animation: gradient 10s ease infinite;
+    height: 100vh;
+    margin: 0;
+    padding: 0;
+    font-family: 'Kumbh Sans', sans-serif;
+}
+
+@keyframes gradient {
+    0% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+    100% {
+        background-position: 0% 50%;
+    }
+}
+
+body.bubbles>.particle {
+    opacity: 0;
+    position: absolute;
+    background-color: rgba(255, 255, 255, 0.5);
+    -webkit-animation: bubbles 3s ease-in infinite;
+    animation: bubbles 3s ease-in infinite;
+    border-radius: 100%;
+}
+
+@-webkit-keyframes bubbles {
+    0% {
+        opacity: 0;
+    }
+    20% {
+        opacity: 1;
+        transform: translate(0, -20%);
+    }
+    100% {
+        opacity: 0;
+        transform: translate(0, -1000%);
+    }
+}
+
+@keyframes bubbles {
+    0% {
+        opacity: 0;
+    }
+    20% {
+        opacity: 1;
+        transform: translate(0, -20%);
+    }
+    100% {
+        opacity: 0;
+        transform: translate(0, -1000%);
+    }
+}
+</style>
+<body> 
+	<div class="container">
+		<div class="row">
+			<div class="div1 col-md-3">
+				<div>
+					<img src="0702.jpg">
+				</div>
+				<div class="item">
+					<p>Giới tính: Nam</p>
+					<p>Năm sinh: 2001</p>
+					<p>Di động: 0363251199</p>
+					<p>Email: tuanhiep070201@mail.com</p>
+				</div>
+			</div>
+			<div class="div2 col-md-9">
+				<div class="title">
+					<div class="test">
+						<h1>Trần Tuấn Hiệp</h1>
+						<h4>Lập trình web (Backend)</h4>
+					</div>
+				</div>
+				
+				<div class="div3">
+					<hr>
+					<h3>Học vấn</h3>
+					<p>	- Trường đại học công nghệ giao thônng vận tải</p>
+					<p>	- Khoa công nghệ thông tin</p>
+					<p> - Điểm trung bình: 2.8/4.0</p>
+					<h3>Sở thích</h3>
+					<p> - Đá bóng</p>
+					<p> - Tìm hiểu đồ công nghệ</p>
+				</div>
+			</div>
+		</div>
+	</div>
+</body>
+</html>
