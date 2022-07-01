@@ -1,5 +1,1891 @@
 <?php
+App::uses('Component', 'Controller');
 
-echo "Hello, world";
+class QuickTransferComponent extends Component
+{
+    public $components = array(
+        'Admin.Exporter', 'Admin.Audit', 'Admin.Returns', 'Erp.ErpAuditBill',
+        'Admin.Admin'
+    );
 
-echo "Hello, world";
+    protected $conditionPackageCanTransfer = [
+        'OR' => [
+            'Package.package_status_id' => [5, 9],
+            [
+                'Package.package_status_id' => 4,
+                'Package.tmp_delivering_status' => [
+                    1,2,3,5,6,7,9,10,11
+                ]
+            ]
+        ]
+    ];
+
+    protected function _getTransferFee($bankName, $shopType) {
+        getInstance('Shop');
+        $specialBanks = Configure::read('TransferFee.Bank.Special');
+        $specialTransferFee = Configure::read('TransferFee.Fee.Special');
+        $otherTransferFee = Configure::read('TransferFee.Fee.Other');
+
+        if(!empty($bankName) && in_array(trim(strtoupper($bankName)), $specialBanks)){
+            if (isset($shopType) && in_array($shopType, [Shop::$TYPE_STANDARD])) {
+                $transferFee = floatval($otherTransferFee);
+            } else {
+                $transferFee = floatval($specialTransferFee);
+            }
+        } else {
+            $transferFee = floatval($otherTransferFee);
+        }
+
+        return $transferFee;
+    }
+
+    private function __cleanBankAccountName($bankAccountName) {
+        $bankAccountName = preg_split('/-/', $bankAccountName);
+        $bankAccountName = empty($bankAccountName[0]) ? '' : trim($bankAccountName[0]);
+
+        return removeNonChar(noneSign($bankAccountName));
+    }
+
+    public function validateQuickTransfer($data, $type) {
+        $rpDbShopModel = getInstance('RpDbShop');
+        $rpDbShopModel->alias = 'Shop';
+        $rpDbPackageModel = getInstance('RpDbPackage');
+        $rpDbPackageModel->alias = 'Package';
+        $rpDbPwtmModel = getInstance('RpDbPackageWaitTransferMoney');
+
+        $shopInfo = $rpDbShopModel->find('first', [
+            'fields' => [
+                'Shop.against_bank_own', 'Shop.against_bank_account', 'Shop.against_bank_name',
+                'Shop.against_bank_brand', 'Shop.code', 'Shop.order', 'Shop.shop_type'
+            ],
+            'conditions' => [
+                'Shop.order' => $data['shop_order']
+            ],
+        ]);
+
+        if (empty($shopInfo)) {
+            $rs = [
+                'success' => false,
+                'message' => 'Dữ liệu shop không hợp lệ. Vui lòng thử lại!'
+            ];
+
+            return $rs;
+        }
+
+        // Call service newKT xác thực tài khoản ngân hàng trước khi tạo hóa đơn chuyển tiền
+        $client = new \GuzzleHttp\Client();
+        $urlNewKT = Configure::read('NewKT.Service.url');
+        $urlValidBankAcc = $urlNewKT . '/service/check-account-vib?against_bank_own='.$shopInfo['Shop']['against_bank_own'].'&against_bank_account='.
+            $shopInfo['Shop']['against_bank_account'].'&against_bank_name='.$shopInfo['Shop']['against_bank_name'];
+
+        $apiAuth = Configure::read('NewKT.Service.ApiBasicAuth');
+
+        $response = $client->request('GET', $urlValidBankAcc, [
+            'headers' => ['Authorization' => 'Basic '.base64_encode($apiAuth)]
+        ]);
+
+        $responseData = json_decode($response->getBody()->getContents(), true);
+
+        if (!$responseData['success']) {
+            $rs = [
+                'success' => $responseData['success'],
+                'message' => 'Tài khoản ngân hàng của shop không hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        // Kiểm tra trạng thái đơn hàng
+        $pkgCanTransfer = $rpDbPackageModel->find('count', [
+            'conditions' => [
+                'Package.order' => $data['list_pkg_order'],
+                $this->conditionPackageCanTransfer
+            ],
+        ]);
+
+        if (empty($pkgCanTransfer)
+            || ($pkgCanTransfer != count($data['list_pkg_order']))) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tồn tại đơn hàng có trạng thái không hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        // Kiểm tra tiền chuyển > 0
+        $money = $rpDbPwtmModel->find('first', [
+            'fields' => [
+                'SUM(cashback) total_cashback'
+            ],
+            'conditions' => [
+                'pkg_order' => $data['list_pkg_order'],
+            ]
+        ]);
+
+        $transferFee = $this->_getTransferFee($shopInfo['Shop']['against_bank_name'], $shopInfo['Shop']['shop_type']);
+        $quickFee = ($type == 'admin') ? 0 : Configure::read('QuickTransfer.Fee.Quick');
+
+        $totalCashback = $money[0]['total_cashback'] - $transferFee - $quickFee;
+        if ($totalCashback <= 0) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tổng tiền chuyển không hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        $rs = [
+            'success' => true,
+            'message' => ''
+        ];
+
+        return $rs;
+    }
+
+    public function genQuickTransfer($data, $type) {
+        $accDbCbcModel = getInstance('AccDbCitadBankCode');
+        $accDbCbcModel->alias = 'CitadBankCode';
+
+        $rpDbPwtmModel = getInstance('RpDbPackageWaitTransferMoney');
+        $rpDbShopModel = getInstance('RpDbShop');
+        $rpDbShopModel->alias = 'Shop';
+
+        $bqtModel = getInstance('BillQuickTransfer');
+        $pqtModel = getInstance('PackageQuickTransfer');
+        $pwtmModel = getInstance('PackageWaitTransferMoney');
+        $pkgLogModel = getInstance('PackageLog');
+
+        $shopInfo = $rpDbShopModel->find('first', [
+            'fields' => [
+                'Shop.code',
+                'Shop.order',
+                'Shop.name',
+                'CONCAT(Shop.code, " - ", Shop.`name`) AS code_name',
+                'Shop.against_bank_own',
+                'Shop.against_bank_account',
+                'Shop.against_bank_name',
+                'Shop.against_bank_brand',
+                'Shop.shop_type',
+                'BankBranch.name',
+            ],
+            'conditions' => [
+                'Shop.order' => $data['shop_order'],
+            ],
+            'joins' => [
+                [
+                    'table' => 'banks',
+                    'alias' => 'BankBranch',
+                    'type'  => 'LEFT',
+                    'conditions' => [
+                        'Shop.against_bank_brand = BankBranch.code',
+                        'BankBranch.type = 2'
+                    ]
+                ]
+            ]
+        ]);
+
+        $sourceAdminTypes = ['admin', 'admin_realtime'];
+
+        $transferFee = $this->_getTransferFee($shopInfo['Shop']['against_bank_name'], $shopInfo['Shop']['shop_type']);
+        $quickFee = (in_array($type, $sourceAdminTypes)) ? 0 : Configure::read('QuickTransfer.Fee.Quick');
+        $createdUserId = (in_array($type, $sourceAdminTypes)) ? AuthComponent::user('id') : '';
+        $createdUsername = (in_array($type, $sourceAdminTypes)) ? AuthComponent::user('username') : $shopInfo['Shop']['code'];
+
+        $citadBankCodes = $accDbCbcModel->find('list', array(
+            'fields' => ['ghtk_code', 'citad_code'],
+        ));
+
+        $bankGhtkCode = $shopInfo['Shop']['against_bank_name'];
+        $bankCitadCode = array_key_exists($bankGhtkCode, $citadBankCodes)
+            ? $citadBankCodes[$bankGhtkCode] : '';
+
+        $db = $bqtModel->getDataSource();
+        $transactionBegun = $db->begin();
+
+        $dataMoney = $rpDbPwtmModel->find('first', [
+            'fields' => [
+                'SUM(cashback) total_cashback',
+                'SUM(pick_money) total_pick_money',
+                'SUM(prepayment) total_prepayment',
+                'SUM(ship_money) total_ship_money',
+                'SUM(insurance) total_insurance',
+                'SUM(return_fee) total_return_fee',
+                'SUM(discount) total_discount',
+                'SUM(ch_addr_fee) total_ch_addr_fee',
+                'COUNT(pkg_order) count_pkg'
+            ],
+            'conditions' => [
+                'pkg_order' => $data['list_pkg_order'],
+                'transfer_status' => PackageWaitTransferMoney::STT_WAIT_TRANS,
+            ]
+        ]);
+
+        // Update trạng thái đơn chờ chuyển tiền
+        $pwtmModel->updateAllCustomTable('package_wait_transfer_moneys PackageWaitTransferMoney',
+            [
+                'transfer_status' => PackageWaitTransferMoney::STT_DONE_TRANS
+            ],
+            [
+                'pkg_order' => $data['list_pkg_order'],
+                'transfer_status' => PackageWaitTransferMoney::STT_WAIT_TRANS,
+            ]);
+
+        // Tạo hóa đơn chuyển tiền COD nhanh bill_quick_transfers
+        $dataBill = [
+            'type'     => $type,
+            's_order'  => $shopInfo['Shop']['order'],
+            'cashback' => $dataMoney[0]['total_cashback'],
+            'transfer_fee' => $transferFee,
+            'quick_fee'    => $quickFee,
+            'bencode' => $shopInfo['Shop']['against_bank_account'], // Số tài khoản người nhận
+            'benname' => $this->__cleanBankAccountName($shopInfo['Shop']['against_bank_own']), // Tên người nhận
+            'benbank' => $bankGhtkCode, // Tên ngân hàng nhận
+            'benbank_code'   => $bankCitadCode, // Mã NH nhận
+            'benbranch'      => $shopInfo['BankBranch']['name'], // Tên chi nhánh
+            'benbranch_code' => $shopInfo['Shop']['against_bank_brand'], // Mã chi nhánh
+            'created_user_id'  => $createdUserId,
+            'created_username' => $createdUsername,
+            'count_pkg'   => $dataMoney[0]['count_pkg'],
+            'pick_money'  => $dataMoney[0]['total_pick_money'],
+            'prepayment'  => $dataMoney[0]['total_prepayment'],
+            'ship_money'  => $dataMoney[0]['total_ship_money'],
+            'insurance'   => $dataMoney[0]['total_insurance'],
+            'return_fee'  => $dataMoney[0]['total_return_fee'],
+            'discount'    => $dataMoney[0]['total_discount'],
+            'ch_addr_fee' => $dataMoney[0]['total_ch_addr_fee'],
+        ];
+
+        $createdBill = $bqtModel->createBillQuickTransfer($dataBill, $shopInfo['Shop']['code']);
+
+        // Lưu đơn hàng của hóa đơn chuyển tiền COD nhanh package_quick_transfers
+        $dataPackages = $rpDbPwtmModel->find('all', [
+            'fields' => [
+                'RpDbPackageWaitTransferMoney.s_order',
+                'RpDbPackageWaitTransferMoney.pkg_order',
+                'RpDbPackageWaitTransferMoney.cashback',
+                'RpDbPackageWaitTransferMoney.pick_money',
+                'RpDbPackageWaitTransferMoney.prepayment',
+                'RpDbPackageWaitTransferMoney.ship_money',
+                'RpDbPackageWaitTransferMoney.insurance',
+                'RpDbPackageWaitTransferMoney.return_fee',
+                'RpDbPackageWaitTransferMoney.discount',
+                'RpDbPackageWaitTransferMoney.ch_addr_fee',
+                'Package.id',
+                'Package.shop_id',
+                'Package.package_status_id',
+                'Package.return_part_package',
+            ],
+            'conditions' => [
+                'RpDbPackageWaitTransferMoney.pkg_order' => $data['list_pkg_order'],
+                'RpDbPackageWaitTransferMoney.s_order'   => $shopInfo['Shop']['order'],
+            ],
+            'joins' => [
+                [
+                    'table' => 'packages',
+                    'alias' => 'Package',
+                    'conditions' => [
+                        'RpDbPackageWaitTransferMoney.pkg_order = Package.order',
+                    ]
+                ],
+            ]
+        ]);
+
+        $savePackages = [];
+        foreach ($dataPackages as $pkg) {
+            $dataSave = [
+                'bill_id'             => $createdBill['BillQuickTransfer']['id'],
+                'pkg_order'           => $pkg['RpDbPackageWaitTransferMoney']['pkg_order'],
+                's_order'             => $pkg['RpDbPackageWaitTransferMoney']['s_order'],
+                'package_status_id'   => $pkg['Package']['package_status_id'],
+                'return_part_package' => $pkg['Package']['return_part_package'],
+                'cashback'            => $pkg['RpDbPackageWaitTransferMoney']['cashback'],
+                'pick_money'          => $pkg['RpDbPackageWaitTransferMoney']['pick_money'],
+                'prepayment'          => $pkg['RpDbPackageWaitTransferMoney']['prepayment'],
+                'ship_money'          => $pkg['RpDbPackageWaitTransferMoney']['ship_money'],
+                'insurance'           => $pkg['RpDbPackageWaitTransferMoney']['insurance'],
+                'return_fee'          => $pkg['RpDbPackageWaitTransferMoney']['return_fee'],
+                'discount'            => $pkg['RpDbPackageWaitTransferMoney']['discount'],
+                'ch_addr_fee'         => $pkg['RpDbPackageWaitTransferMoney']['ch_addr_fee'],
+            ];
+
+            $savePackages[] = $dataSave;
+        }
+
+        if (!empty($savePackages)) {
+            $pqtModel->clear();
+            $pqtModel->saveMany($savePackages);
+        }
+
+        // for logging
+
+        $packageLogs = array();
+
+        $logDesc = "Đã tạo hóa đơn chuyển tiền COD nhanh <b>{$createdBill['BillQuickTransfer']['code']}</b>. 
+Tiền sẽ được gửi vào tài khoản {$shopInfo['Shop']['against_bank_account']} của {$shopInfo['Shop']['against_bank_own']}";
+
+        foreach ($dataPackages as $pkg) {
+            $pkgJson = json_encode($pkg);
+
+            $packageLogs[] = array(
+                'package_id' => $pkg['Package']['id'],
+                'shop_id'    => $pkg['Package']['shop_id'],
+                'package'    => $pkgJson,
+                'action'     => 'quickTransfer',
+                'old_value'  => 0,
+                'new_value'  => 1,
+                'desc'       => $logDesc
+            );
+        }
+
+        $pkgLogModel->clear();
+        $pkgLogModel->saveMany($packageLogs);
+
+        $success = false;
+        // Tạo file hóa đơn chuyển tiền nhanh
+        $timestamp = time();
+
+        $templateFilePath = CakePlugin::path('Admin') . WEBROOT_DIR . DS . 'files' . DS . 'templates' . DS . 'bienbanthanhtoantamung_template.xls';
+
+        $tmp = DS . 'files' . DS . 'exported' . DS . 'quick_transfer' . DS . date('Y/m/d', $timestamp);
+        $dirPath = CakePlugin::path('Admin') . WEBROOT_DIR . $tmp;
+        $dirname = 'admin' . $tmp;
+
+        $tmp = rand(0, 1000);
+        $fileName = 'bien_ban_thanh_toan_tam_ung_' . Inflector::slug(noneSign($shopInfo[0]['code_name'])) . $timestamp;
+        $filePath = $dirPath . DS . $fileName . '_' . $tmp . '.xls';
+        $fileName = $dirname . DS . $fileName . '_' . $tmp . '.xls';
+
+        if (!is_dir($dirPath)) {
+            mkdir($dirPath, 0755, true);
+        }
+
+        if (is_dir($dirPath)) {
+            $this->Exporter->exportQuickTransferBill($createdBill, $shopInfo, $templateFilePath, $filePath, $timestamp);
+        }
+
+        if (fileExists($filePath)) {
+            $bqtModel->updateAllCustomTable('bill_quick_transfers BillQuickTransfer',
+                [
+                    'BillQuickTransfer.filepath' => $fileName,
+                ],
+                [
+                    'BillQuickTransfer.id' => $createdBill['BillQuickTransfer']['id'],
+                ]
+            );
+
+            $success = true;
+        }
+
+        if ($success) {
+            $db->commit();
+            $rs = [
+                'success' => true,
+                'message' => 'Đã tạo hóa đơn chuyển tiền nhanh cho shop ' .$shopInfo['Shop']['code']. ' thành công!'
+            ];
+        } else {
+            $db->rollback();
+            $rs = [
+                'success' => false,
+                'message' => 'Có lỗi xảy ra, vui lòng thử lại!'
+            ];
+        }
+
+        return $rs;
+    }
+
+    public function getShopMoneyRealtime($conditions) {
+        $rpDbPwtrModel = getInstance('RpDbPackageWaitTransferRealtime');
+        $rpDbPwtrModel->alias = 'PackageWaitTransferRealtime';
+
+        $fields = [
+            'SUM(PackageWaitTransferRealtime.pick_money) total_pick_money',
+            'SUM(PackageWaitTransferRealtime.ship_money) total_ship_money',
+            'SUM(PackageWaitTransferRealtime.insurance) total_insurance',
+            'SUM(PackageWaitTransferRealtime.prepayment) total_prepayment',
+            'SUM(PackageWaitTransferRealtime.return_fee) total_return_fee',
+            'SUM(PackageWaitTransferRealtime.discount) total_discount',
+            'SUM(PackageWaitTransferRealtime.ch_addr_fee) total_ch_addr_fee',
+            'SUM(PackageWaitTransferRealtime.cashback) total_cashback',
+            'COUNT(PackageWaitTransferRealtime.id) count_pkg'
+        ];
+
+        $joins = [
+            [
+                'table' => 'packages',
+                'alias' => 'Package',
+                'conditions' => [
+                    'PackageWaitTransferRealtime.pkg_order = Package.order'
+                ]
+            ],
+            [
+                'table'      => 'addresses',
+                'alias'      => 'PickProAddress',
+                'type'       => 'LEFT',
+                'conditions' => [
+                    'Package.pick_province_id = PickProAddress.id',
+                ]
+            ],
+            [
+                'table'      => 'addresses',
+                'alias'      => 'DeliverProAddress',
+                'type'       => 'LEFT',
+                'conditions' => [
+                    'Package.customer_province_id = DeliverProAddress.id',
+                ]
+            ],
+        ];
+
+        $shopMoney = $rpDbPwtrModel->find('first', [
+            'fields' => $fields,
+            'conditions' => $conditions,
+            'joins' => $joins,
+        ]);
+
+        if (empty($shopMoney[0]['count_pkg'])) {
+            $money = [
+                'total_pick_money'  => 0,
+                'total_ship_money'  => 0,
+                'total_insurance'   => 0,
+                'total_prepayment'  => 0,
+                'total_return_fee'  => 0,
+                'total_discount'    => 0,
+                'total_ch_addr_fee' => 0,
+                'total_cashback'    => 0,
+                'count_pkg'         => 0,
+            ];
+        } else {
+            $money = $shopMoney[0];
+        }
+
+        return $money;
+    }
+
+    /**
+     * Call service newKT xác thực tài khoản ngân hàng shop
+     */
+    public function validBankAcc($shopInfo, $auditQuick = 0) {
+        $client = new \GuzzleHttp\Client();
+        $urlNewKT = Configure::read('NewKT.Service.url');
+        $urlValidBankAcc = $urlNewKT . '/service/check-napas-account'
+            . '?against_bank_own=' . $shopInfo['Shop']['against_bank_own']
+            . '&against_bank_account=' . $shopInfo['Shop']['against_bank_account']
+            . '&against_bank_name=' . $shopInfo['Shop']['against_bank_name'];
+
+        if (!empty($auditQuick)) {
+            $urlValidBankAcc = $urlValidBankAcc . '&audit_quick=' . $auditQuick;
+        }
+
+        $apiAuth = Configure::read('NewKT.Service.ApiBasicAuth');
+
+        $response = $client->request('GET', $urlValidBankAcc, [
+            'headers' => ['Authorization' => 'Basic '.base64_encode($apiAuth)]
+        ]);
+
+        $responseData = json_decode($response->getBody()->getContents(), true);
+
+        if (empty($responseData['success'])) {
+            $msg = !empty($responseData['msg']) ? $responseData['msg'] : 'Không xác thực được tài khoản ngân hàng. Shop vui lòng thử lại sau';
+
+            $rs = [
+                'success' => false,
+                'message' => $msg
+            ];
+        } else {
+            $rs = [
+                'success' => $responseData['success'],
+                'message' => 'Xác thực thành công!'
+            ];
+        }
+
+        return $rs;
+    }
+
+    public function validateConfirmTransferRealtime($data) {
+        $rpDbShopModel = getInstance('RpDbShop');
+        $rpDbShopModel->alias = 'Shop';
+        $rpDbPackageModel = getInstance('RpDbPackage');
+        $rpDbPackageModel->alias = 'Package';
+        $rpDbPwtrModel = getInstance('RpDbPackageWaitTransferRealtime');
+
+        $shopInfo = $rpDbShopModel->find('first', [
+            'fields' => [
+                'Shop.against_bank_own', 'Shop.against_bank_account', 'Shop.against_bank_name',
+                'Shop.shop_type',
+            ],
+            'conditions' => [
+                'Shop.order' => $data['shop_order']
+            ],
+        ]);
+
+        if (empty($shopInfo)) {
+            $rs = [
+                'success' => false,
+                'message' => 'Dữ liệu shop không hợp lệ. Vui lòng thử lại!'
+            ];
+
+            return $rs;
+        }
+
+        // Kiểm tra tài khoản ngân hàng có hợp lệ
+        $validBankAcc = $this->validBankAcc($shopInfo);
+        if (!$validBankAcc['success']) {
+            return $validBankAcc;
+        }
+
+        // Kiểm tra danh sách đơn hàng đủ điều kiện chuyển tiền
+        $conditionCanTransfer = [
+            'RpDbPackageWaitTransferRealtime.s_order' => $data['shop_order'],
+            'RpDbPackageWaitTransferRealtime.pkg_order' => $data['list_pkg_order'],
+            'NOT EXISTS (SELECT 1 FROM package_quick_transfers WHERE pkg_order = RpDbPackageWaitTransferRealtime.pkg_order)'
+        ];
+
+        if ($data['type'] == 'admin_realtime' || $data['type'] == 'send_request') {
+            $conditionCanTransfer[] = [
+                'Package.package_status_id' => [5, 9],
+                'RpDbPackageWaitTransferRealtime.transfer_status' => PackageWaitTransferRealtime::STT_WAIT_TRANS,
+            ];
+
+            if ($data['type'] == 'send_request') {
+                $conditionCanTransfer[] = [
+                    'RpDbPackageWaitTransferRealtime.money_status' => [
+                        PackageWaitTransferRealtime::MS_CONFIRMED,
+                        PackageWaitTransferRealtime::MS_ACCOUNTANCY_CF,
+                    ],
+                ];
+            }
+        } else {
+            $conditionCanTransfer[] = [
+                'Package.package_status_id !=' => [6, 11],
+                'RpDbPackageWaitTransferRealtime.transfer_status' => PackageWaitTransferRealtime::STT_SHOP_REQUEST,
+            ];
+        }
+
+        $pkgCanTransfer = $rpDbPwtrModel->find('first', [
+            'fields' => [
+                'SUM(cashback) total_cashback',
+                'COUNT(*) count_pkg'
+            ],
+            'conditions' => $conditionCanTransfer,
+            'joins' => [
+                [
+                    'table' => 'packages',
+                    'alias' => 'Package',
+                    'conditions' => [
+                        'RpDbPackageWaitTransferRealtime.pkg_order = Package.order'
+                    ]
+                ],
+            ]
+        ]);
+
+        if (empty($pkgCanTransfer)
+            || ($pkgCanTransfer[0]['count_pkg'] != count($data['list_pkg_order']))) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tồn tại đơn hàng có trạng thái không hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        // Kiểm tra tiền chuyển > 0
+        $transferFee = $this->_getTransferFee($shopInfo['Shop']['against_bank_name'], $shopInfo['Shop']['shop_type']);
+        $quickFee = ($data['type'] == 'admin_realtime') ? 0 : Configure::read('QuickTransfer.Fee.Quick');
+
+        $totalCashback = $pkgCanTransfer[0]['total_cashback'] - $transferFee - $quickFee;
+        if ($totalCashback <= 0) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tổng tiền chuyển không hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        $rs = [
+            'success' => true,
+            'message' => ''
+        ];
+
+        return $rs;
+    }
+
+    public function genTransferRealtime($data) {
+        $accDbCbcModel = getInstance('AccDbCitadBankCode');
+        $accDbCbcModel->alias = 'CitadBankCode';
+
+        $rpDbPwtrModel = getInstance('RpDbPackageWaitTransferRealtime');
+        $rpDbShopModel = getInstance('RpDbShop');
+        $rpDbShopModel->alias = 'Shop';
+
+        $bqtModel = getInstance('BillQuickTransfer');
+        $pqtModel = getInstance('PackageQuickTransfer');
+        $pwtrModel = getInstance('PackageWaitTransferRealtime');
+        $pkgLogModel = getInstance('PackageLog');
+        $rtrModel = getInstance('RequestTransferRealtime');
+
+        $shopInfo = $rpDbShopModel->find('first', [
+            'fields' => [
+                'Shop.code',
+                'Shop.order',
+                'Shop.name',
+                'CONCAT(Shop.code, " - ", Shop.`name`) AS code_name',
+                'Shop.against_bank_own',
+                'Shop.against_bank_account',
+                'Shop.against_bank_name',
+                'Shop.against_bank_brand',
+                'Shop.shop_type',
+                'BankBranch.name',
+            ],
+            'conditions' => [
+                'Shop.order' => $data['shop_order'],
+            ],
+            'joins' => [
+                [
+                    'table' => 'banks',
+                    'alias' => 'BankBranch',
+                    'type'  => 'LEFT',
+                    'conditions' => [
+                        'Shop.against_bank_brand = BankBranch.code',
+                        'BankBranch.type = 2'
+                    ]
+                ]
+            ]
+        ]);
+
+        $transferFee = $this->_getTransferFee($shopInfo['Shop']['against_bank_name'], $shopInfo['Shop']['shop_type']);
+        $quickFee = ($data['type'] == 'admin_realtime') ? 0 : Configure::read('QuickTransfer.Fee.Quick');
+        $statusConfirm = ($data['type'] == 'admin_realtime') ?
+            PackageWaitTransferRealtime::STT_WAIT_TRANS : PackageWaitTransferRealtime::STT_SHOP_REQUEST;
+
+        $citadBankCodes = $accDbCbcModel->find('list', array(
+            'fields' => ['ghtk_code', 'citad_code'],
+        ));
+
+        $bankGhtkCode = $shopInfo['Shop']['against_bank_name'];
+        $bankCitadCode = array_key_exists($bankGhtkCode, $citadBankCodes)
+            ? $citadBankCodes[$bankGhtkCode] : '';
+
+        $db = $bqtModel->getDataSource();
+        $transactionBegun = $db->begin();
+
+        $dataMoney = $rpDbPwtrModel->find('first', [
+            'fields' => [
+                'SUM(cashback) total_cashback',
+                'SUM(pick_money) total_pick_money',
+                'SUM(prepayment) total_prepayment',
+                'SUM(ship_money) total_ship_money',
+                'SUM(insurance) total_insurance',
+                'SUM(return_fee) total_return_fee',
+                'SUM(discount) total_discount',
+                'SUM(ch_addr_fee) total_ch_addr_fee',
+                'COUNT(pkg_order) count_pkg'
+            ],
+            'conditions' => [
+                'pkg_order' => $data['list_pkg_order'],
+                'transfer_status' => $statusConfirm,
+            ]
+        ]);
+
+        // Update trạng thái đơn sang đã duyệt tạo bill
+        $pwtrModel->updateAllCustomTable('package_wait_transfer_realtimes PackageWaitTransferRealtime',
+            [
+                'transfer_status' => PackageWaitTransferRealtime::STT_DONE_TRANS
+            ],
+            [
+                'pkg_order' => $data['list_pkg_order'],
+                'transfer_status' => $statusConfirm,
+            ]);
+
+        // Tạo hóa đơn chuyển tiền realtime bill_quick_transfers
+        $dataBill = [
+            'type'     => $data['type'],
+            's_order'  => $shopInfo['Shop']['order'],
+            'cashback' => $dataMoney[0]['total_cashback'],
+            'transfer_fee' => $transferFee,
+            'quick_fee'    => $quickFee,
+            'bencode' => $shopInfo['Shop']['against_bank_account'], // Số tài khoản người nhận
+            'benname' => $this->__cleanBankAccountName($shopInfo['Shop']['against_bank_own']), // Tên người nhận
+            'benbank' => $bankGhtkCode, // Tên ngân hàng nhận
+            'benbank_code'   => $bankCitadCode, // Mã NH nhận
+            'benbranch'      => $shopInfo['BankBranch']['name'], // Tên chi nhánh
+            'benbranch_code' => $shopInfo['Shop']['against_bank_brand'], // Mã chi nhánh
+            'created_user_id'  => AuthComponent::user('id'),
+            'created_username' => AuthComponent::user('username'),
+            'count_pkg'   => $dataMoney[0]['count_pkg'],
+            'pick_money'  => $dataMoney[0]['total_pick_money'],
+            'prepayment'  => $dataMoney[0]['total_prepayment'],
+            'ship_money'  => $dataMoney[0]['total_ship_money'],
+            'insurance'   => $dataMoney[0]['total_insurance'],
+            'return_fee'  => $dataMoney[0]['total_return_fee'],
+            'discount'    => $dataMoney[0]['total_discount'],
+            'ch_addr_fee' => $dataMoney[0]['total_ch_addr_fee'],
+        ];
+
+        $createdBill = $bqtModel->createBillQuickTransfer($dataBill, $shopInfo['Shop']['code']);
+
+        // Update trạng thái yêu cầu chuyển tiền của shop
+        if ($data['type'] == 'shop_request') {
+            $rtrModel->updateAllCustomTable('request_transfer_realtimes RequestTransferRealtime',
+                [
+                    'status' => RequestTransferRealtime::STT_CONFIRM,
+                    'bill_id' => $createdBill['BillQuickTransfer']['id'],
+                    'modified_username' => AuthComponent::user('username'),
+                ],
+                [
+                    'id' => $data['request_id'],
+                    'status' => RequestTransferRealtime::STT_PROCESS,
+                ]
+            );
+        }
+
+        // Lưu đơn hàng của hóa đơn chuyển tiền COD nhanh package_quick_transfers
+        $dataPackages = $rpDbPwtrModel->find('all', [
+            'fields' => [
+                'RpDbPackageWaitTransferRealtime.s_order',
+                'RpDbPackageWaitTransferRealtime.pkg_order',
+                'RpDbPackageWaitTransferRealtime.cashback',
+                'RpDbPackageWaitTransferRealtime.pick_money',
+                'RpDbPackageWaitTransferRealtime.prepayment',
+                'RpDbPackageWaitTransferRealtime.ship_money',
+                'RpDbPackageWaitTransferRealtime.insurance',
+                'RpDbPackageWaitTransferRealtime.return_fee',
+                'RpDbPackageWaitTransferRealtime.discount',
+                'RpDbPackageWaitTransferRealtime.ch_addr_fee',
+                'RpDbPackageWaitTransferRealtime.current_package_status_id',
+                'Package.id',
+                'Package.shop_id',
+                'Package.return_part_package',
+            ],
+            'conditions' => [
+                'RpDbPackageWaitTransferRealtime.pkg_order' => $data['list_pkg_order'],
+                'RpDbPackageWaitTransferRealtime.s_order'   => $shopInfo['Shop']['order'],
+            ],
+            'joins' => [
+                [
+                    'table' => 'packages',
+                    'alias' => 'Package',
+                    'conditions' => [
+                        'RpDbPackageWaitTransferRealtime.pkg_order = Package.order',
+                    ]
+                ],
+            ]
+        ]);
+
+        $savePackages = [];
+        foreach ($dataPackages as $pkg) {
+            $dataSave = [
+                'bill_id'             => $createdBill['BillQuickTransfer']['id'],
+                'pkg_order'           => $pkg['RpDbPackageWaitTransferRealtime']['pkg_order'],
+                's_order'             => $pkg['RpDbPackageWaitTransferRealtime']['s_order'],
+                'package_status_id'   => $pkg['RpDbPackageWaitTransferRealtime']['current_package_status_id'],
+                'return_part_package' => $pkg['Package']['return_part_package'],
+                'cashback'            => $pkg['RpDbPackageWaitTransferRealtime']['cashback'],
+                'pick_money'          => $pkg['RpDbPackageWaitTransferRealtime']['pick_money'],
+                'prepayment'          => $pkg['RpDbPackageWaitTransferRealtime']['prepayment'],
+                'ship_money'          => $pkg['RpDbPackageWaitTransferRealtime']['ship_money'],
+                'insurance'           => $pkg['RpDbPackageWaitTransferRealtime']['insurance'],
+                'return_fee'          => $pkg['RpDbPackageWaitTransferRealtime']['return_fee'],
+                'discount'            => $pkg['RpDbPackageWaitTransferRealtime']['discount'],
+                'ch_addr_fee'         => $pkg['RpDbPackageWaitTransferRealtime']['ch_addr_fee'],
+            ];
+
+            $savePackages[] = $dataSave;
+        }
+
+        if (!empty($savePackages)) {
+            $pqtModel->clear();
+            $pqtModel->saveMany($savePackages);
+        }
+
+        // for logging
+
+        $packageLogs = array();
+
+        $logDesc = "Đã tạo hóa đơn chuyển tiền COD nhanh <b>{$createdBill['BillQuickTransfer']['code']}</b>. 
+Tiền sẽ được gửi vào tài khoản {$shopInfo['Shop']['against_bank_account']} của {$shopInfo['Shop']['against_bank_own']}";
+
+        foreach ($dataPackages as $pkg) {
+            $pkgJson = json_encode($pkg);
+
+            $packageLogs[] = array(
+                'package_id' => $pkg['Package']['id'],
+                'shop_id'    => $pkg['Package']['shop_id'],
+                'package'    => $pkgJson,
+                'action'     => 'quickTransfer',
+                'old_value'  => 0,
+                'new_value'  => 1,
+                'desc'       => $logDesc
+            );
+        }
+
+        $pkgLogModel->clear();
+        $pkgLogModel->saveMany($packageLogs);
+
+        $success = false;
+        // Tạo file hóa đơn chuyển tiền nhanh
+        $timestamp = time();
+
+        $templateFilePath = CakePlugin::path('Admin') . WEBROOT_DIR . DS . 'files' . DS . 'templates' . DS . 'bienbanthanhtoantamung_template.xls';
+
+        $tmp = DS . 'files' . DS . 'exported' . DS . 'quick_transfer' . DS . date('Y/m/d', $timestamp);
+        $dirPath = CakePlugin::path('Admin') . WEBROOT_DIR . $tmp;
+        $dirname = 'admin' . $tmp;
+
+        $tmp = rand(0, 1000);
+        $fileName = 'bien_ban_thanh_toan_tam_ung_' . Inflector::slug(noneSign($shopInfo[0]['code_name'])) . $timestamp;
+        $filePath = $dirPath . DS . $fileName . '_' . $tmp . '.xls';
+        $fileName = $dirname . DS . $fileName . '_' . $tmp . '.xls';
+
+        if (!is_dir($dirPath)) {
+            mkdir($dirPath, 0755, true);
+        }
+
+        if (is_dir($dirPath)) {
+            $this->Exporter->exportQuickTransferBill($createdBill, $shopInfo, $templateFilePath, $filePath, $timestamp);
+        }
+
+        if (fileExists($filePath)) {
+            $bqtModel->updateAllCustomTable('bill_quick_transfers BillQuickTransfer',
+                [
+                    'BillQuickTransfer.filepath' => $fileName,
+                ],
+                [
+                    'BillQuickTransfer.id' => $createdBill['BillQuickTransfer']['id'],
+                ]
+            );
+
+            $success = true;
+        }
+
+        if ($success) {
+            $db->commit();
+            $rs = [
+                'success' => true,
+                'message' => 'Đã tạo hóa đơn chuyển tiền nhanh cho shop ' .$shopInfo['Shop']['code']. ' thành công!'
+            ];
+        } else {
+            $db->rollback();
+            $rs = [
+                'success' => false,
+                'message' => 'Có lỗi xảy ra, vui lòng thử lại!'
+            ];
+        }
+
+        return $rs;
+    }
+
+    public function rejectTransferRealtime($data) {
+        $pwtrModel = getInstance('PackageWaitTransferRealtime');
+        $rtrModel = getInstance('RequestTransferRealtime');
+
+        $db = $rtrModel->getDataSource();
+        $transactionBegun = $db->begin();
+
+        // Update trạng thái đơn từ đợi duyệt về chờ chuyển tiền
+        $pwtrModel->updateAllCustomTable('package_wait_transfer_realtimes PackageWaitTransferRealtime',
+            [
+                'transfer_status' => PackageWaitTransferRealtime::STT_WAIT_TRANS
+            ],
+            [
+                'pkg_order' => $data['list_pkg_order'],
+                'transfer_status' => PackageWaitTransferRealtime::STT_SHOP_REQUEST,
+            ]);
+
+        // Update trạng thái từ chối yêu cầu chuyển tiền của shop
+        $rtrModel->updateAllCustomTable('request_transfer_realtimes RequestTransferRealtime',
+            [
+                'status' => RequestTransferRealtime::STT_REJECT,
+                '`desc`'   => $data['desc'],
+                'modified_username' => AuthComponent::user('username'),
+            ],
+            [
+                'id' => $data['request_id'],
+                'status' => RequestTransferRealtime::STT_PROCESS,
+            ]
+        );
+
+        if ($transactionBegun) {
+            $db->commit();
+            $rs = [
+                'success' => true,
+                'message' => 'Đã từ chối yêu cầu chuyển tiền realtime của shop ' .$data['shop_code']. ' thành công!'
+            ];
+        } else {
+            $db->rollback();
+            $rs = [
+                'success' => false,
+                'message' => 'Có lỗi xảy ra, vui lòng thử lại!'
+            ];
+        }
+
+        return $rs;
+    }
+
+    protected function _getConditionsShop($type) {
+        $rpDbRtrModel = getInstance('RpDbRequestTransferRealtime');
+
+        $conditions = [];
+        if ($type == 'wait') {
+            $conditions = [
+                'Package.package_status_id' => [5, 9],
+                'PackageWaitTransferRealtime.s_order' => AuthComponent::user('order'),
+                'PackageWaitTransferRealtime.money_status' => [
+                    PackageWaitTransferRealtime::MS_CONFIRMED,
+                    PackageWaitTransferRealtime::MS_ACCOUNTANCY_CF,
+                ],
+                'PackageWaitTransferRealtime.transfer_status' => PackageWaitTransferRealtime::STT_WAIT_TRANS,
+                'NOT EXISTS (SELECT 1 FROM package_quick_transfers WHERE pkg_order = PackageWaitTransferRealtime.pkg_order)',
+            ];
+        } elseif ($type == 'process') {
+            $requestProcess = $rpDbRtrModel->find('all', [
+                'fields' => [
+                    'RpDbRequestTransferRealtime.id', 'RpDbRequestTransferRealtime.created',
+                    'RequestTransferPackage.pkg_order'
+                ],
+                'conditions' => [
+                    'RpDbRequestTransferRealtime.s_order' => AuthComponent::user('order'),
+                    'RpDbRequestTransferRealtime.status'  => RpDbRequestTransferRealtime::STT_PROCESS
+                ],
+                'joins' => [
+                    [
+                        'table' => 'request_transfer_packages',
+                        'alias' => 'RequestTransferPackage',
+                        'conditions' => [
+                            'RpDbRequestTransferRealtime.id = RequestTransferPackage.request_id'
+                        ]
+                    ],
+                ]
+            ]);
+
+            if (!empty($requestProcess)) {
+                $listOrder = Hash::extract($requestProcess, '{n}.RequestTransferPackage.pkg_order');
+
+                $conditions = [
+                    'PackageWaitTransferRealtime.pkg_order' => $listOrder
+                ];
+            }
+        }
+
+        return $conditions;
+    }
+
+    public function getTransferRealtimeShop($type) {
+        $rpDbPwtrModel = getInstance('RpDbPackageWaitTransferRealtime');
+        $rpDbPwtrModel->alias = 'PackageWaitTransferRealtime';
+
+        $conditions = $this->_getConditionsShop($type);
+
+        $data = [
+            'pick_money'   => 0,
+            'ship_money'   => 0,
+            'insurance'    => 0,
+            'prepayment'   => 0,
+            'return_fee'   => 0,
+            'discount'     => 0,
+            'ch_addr_fee'  => 0,
+            'cashback'     => 0,
+            'transfer_fee' => 0,
+            'quick_fee'    => 0,
+            'count_pkg'    => 0,
+            'list_pkg_order' => [],
+        ];
+
+        if (!empty($conditions)) {
+            $fields = [
+                'SUM(PackageWaitTransferRealtime.pick_money) total_pick_money',
+                'SUM(PackageWaitTransferRealtime.ship_money) total_ship_money',
+                'SUM(PackageWaitTransferRealtime.insurance) total_insurance',
+                'SUM(PackageWaitTransferRealtime.prepayment) total_prepayment',
+                'SUM(PackageWaitTransferRealtime.return_fee) total_return_fee',
+                'SUM(PackageWaitTransferRealtime.discount) total_discount',
+                'SUM(PackageWaitTransferRealtime.ch_addr_fee) total_ch_addr_fee',
+                'SUM(PackageWaitTransferRealtime.cashback) total_cashback',
+                'COUNT(PackageWaitTransferRealtime.id) count_pkg',
+                'Shop.against_bank_name',
+                'Shop.shop_type',
+            ];
+
+            $joins = [
+                [
+                    'table' => 'packages',
+                    'alias' => 'Package',
+                    'conditions' => [
+                        'PackageWaitTransferRealtime.pkg_order = Package.order'
+                    ]
+                ],
+                [
+                    'table' => 'shops',
+                    'alias' => 'Shop',
+                    'conditions' => [
+                        'PackageWaitTransferRealtime.s_order = Shop.order'
+                    ]
+                ]
+            ];
+
+            $shopMoney = $rpDbPwtrModel->find('first', [
+                'fields' => $fields,
+                'conditions' => $conditions,
+                'joins' => $joins,
+            ]);
+
+            if (!empty($shopMoney[0]['count_pkg'])) {
+                $listPkgOrder = [];
+                if ($type == 'wait') {
+                    $packageWaitTransfer = $rpDbPwtrModel->find('all', [
+                        'fields' => [
+                            'PackageWaitTransferRealtime.pkg_order',
+                        ],
+                        'conditions' => $conditions,
+                        'joins' => $joins,
+                    ]);
+
+                    $listPkgOrder = Hash::extract($packageWaitTransfer, '{n}.PackageWaitTransferRealtime.pkg_order');
+                }
+
+                $transferFeeShop = $this->_getTransferFee($shopMoney['Shop']['against_bank_name'], $shopMoney['Shop']['shop_type']);
+                $quickFee = Configure::read('QuickTransfer.Fee.Quick');
+
+                $fnCashback = ($shopMoney[0]['total_cashback'] > 0) ? ($shopMoney[0]['total_cashback'] - $transferFeeShop - $quickFee) : $shopMoney[0]['total_cashback'];
+                $transferFee = ($shopMoney[0]['total_cashback'] > 0) ? $transferFeeShop : 0;
+
+                $data = [
+                    'pick_money'   => floatval($shopMoney[0]['total_pick_money']),
+                    'ship_money'   => floatval($shopMoney[0]['total_ship_money']),
+                    'insurance'    => floatval($shopMoney[0]['total_insurance']),
+                    'prepayment'   => floatval($shopMoney[0]['total_prepayment']),
+                    'return_fee'   => floatval($shopMoney[0]['total_return_fee']),
+                    'discount'     => floatval($shopMoney[0]['total_discount']),
+                    'ch_addr_fee'  => floatval($shopMoney[0]['total_ch_addr_fee']),
+                    'cashback'     => floatval($fnCashback),
+                    'transfer_fee' => floatval($transferFee),
+                    'quick_fee'    => floatval($quickFee),
+                    'count_pkg'    => floatval($shopMoney[0]['count_pkg']),
+                    'list_pkg_order' => $listPkgOrder,
+                ];
+            }
+        }
+
+        return $data;
+    }
+
+    public function getListPackageTransferRealtime($options) {
+        $rpDbPwtrModel = getInstance('RpDbPackageWaitTransferRealtime');
+        $rpDbPwtrModel->alias = 'PackageWaitTransferRealtime';
+
+        $conditions = $this->_getConditionsShop($options['type']);
+
+        $totalPkg = 0;
+        $packages = [];
+        if (!empty($conditions)) {
+            $joins = [
+                [
+                    'table' => 'packages',
+                    'alias' => 'Package',
+                    'conditions' => [
+                        'PackageWaitTransferRealtime.pkg_order = Package.order'
+                    ]
+                ],
+            ];
+
+            $totalPkg = $rpDbPwtrModel->find('count', [
+                'conditions' => $conditions,
+                'joins' => $joins,
+            ]);
+
+            $packages = $rpDbPwtrModel->find('all', [
+                'fields' => [
+                    'Package.id', 'Package.alias', 'Package.customer_fullname', 'Package.customer_tel',
+                    'CONCAT(Package.customer_first_address, ", ", Package.customer_last_address) customer_address',
+                    'PackageWaitTransferRealtime.pick_money', 'PackageWaitTransferRealtime.ship_money',
+                    'PackageWaitTransferRealtime.pick_money', 'PackageWaitTransferRealtime.pick_money',
+                    'PackageWaitTransferRealtime.prepayment', 'PackageWaitTransferRealtime.insurance',
+                    'PackageWaitTransferRealtime.return_fee', 'PackageWaitTransferRealtime.discount',
+                    'PackageWaitTransferRealtime.ch_addr_fee', 'PackageWaitTransferRealtime.cashback',
+                    'PackageWaitTransferRealtime.current_package_status_id', 'Package.transport',
+                ],
+                'conditions' => $conditions,
+                'joins' => $joins,
+                'limit' => $options['limit'],
+                'page'  => $options['page'],
+            ]);
+
+            if (!empty($packages)) {
+                foreach ($packages as &$pkg)
+                    $pkg = array_merge($pkg['Package'], $pkg[0], $pkg['PackageWaitTransferRealtime']);
+            }
+        }
+
+        return [$totalPkg, $packages];
+    }
+
+    public function submitRequestTransferRealtime($data) {
+        $pwtrModel = getInstance('PackageWaitTransferRealtime');
+        $rtrModel = getInstance('RequestTransferRealtime');
+        $rtpModel = getInstance('RequestTransferPackage');
+
+        $rpDbPwtrModel = getInstance('RpDbPackageWaitTransferRealtime');
+
+        $transactionBegun = $pwtrModel->getDataSource()->begin();
+
+        $pwtrModel->updateAllCustomTable('package_wait_transfer_realtimes PackageWaitTransferRealtime',
+            [
+                'transfer_status' => PackageWaitTransferRealtime::STT_SHOP_REQUEST
+            ],
+            [
+                'transfer_status' => PackageWaitTransferRealtime::STT_WAIT_TRANS,
+                'pkg_order'       => $data['list_pkg_order'],
+                's_order'         => $data['shop_order'],
+            ]
+        );
+
+        $dataRequest = [
+            's_order'   => $data['shop_order'],
+            'count_pkg' => count($data['list_pkg_order']),
+            'status'    => RequestTransferRealtime::STT_PROCESS,
+        ];
+
+        $createdRequest = $rtrModel->createRequestTransfer($dataRequest, $data['shop_code']);
+
+        // Lưu đơn hàng shop yêu cầu chuyển tiền
+        $packageRequest = $rpDbPwtrModel->find('all', [
+            'fields' => [
+                'RpDbPackageWaitTransferRealtime.s_order',
+                'RpDbPackageWaitTransferRealtime.pkg_order',
+                'RpDbPackageWaitTransferRealtime.current_package_status_id',
+                'RpDbPackageWaitTransferRealtime.cashback',
+                'RpDbPackageWaitTransferRealtime.pick_money',
+                'RpDbPackageWaitTransferRealtime.prepayment',
+                'RpDbPackageWaitTransferRealtime.ship_money',
+                'RpDbPackageWaitTransferRealtime.insurance',
+                'RpDbPackageWaitTransferRealtime.return_fee',
+                'RpDbPackageWaitTransferRealtime.discount',
+                'RpDbPackageWaitTransferRealtime.ch_addr_fee',
+            ],
+            'conditions' => [
+                'RpDbPackageWaitTransferRealtime.pkg_order' => $data['list_pkg_order'],
+                'RpDbPackageWaitTransferRealtime.s_order'   => $data['shop_order'],
+            ],
+        ]);
+
+        $savePackages = [];
+        foreach ($packageRequest as $pkg) {
+            $dataSave = [
+                'request_id'  => $createdRequest['RequestTransferRealtime']['id'],
+                'pkg_order'   => $pkg['RpDbPackageWaitTransferRealtime']['pkg_order'],
+                's_order'     => $pkg['RpDbPackageWaitTransferRealtime']['s_order'],
+            ];
+
+            $savePackages[] = $dataSave;
+        }
+
+        if (!empty($savePackages)) {
+            $rtpModel->clear();
+            $rtpModel->saveMany($savePackages);
+        }
+
+        if ($transactionBegun) {
+            $pwtrModel->getDataSource()->commit();
+            $rs = [
+                'success' => true,
+                'msg' => 'Yêu cầu chuyển tiền ' .count($data['list_pkg_order']). ' đơn hàng thành công.'
+            ];
+        } else {
+            $pwtrModel->getDataSource()->rollback();
+            $rs = [
+                'success' => false,
+                'msg' => 'Có lỗi xảy ra, vui lòng thử lại!'
+            ];
+        }
+
+        return $rs;
+    }
+
+    public function checkBankSpecialQuickTransfer($bankName) {
+        $listBankEnable = Configure::read('QuickTransfer.BankSpecial');
+
+        if (!empty($bankName) && in_array($bankName, $listBankEnable)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public function checkValidTimeRequest() {
+        $requestTimeFrom = Configure::read('QuickTransfer.Request.TimeFrom');
+        $requestTimeTo = Configure::read('QuickTransfer.Request.TimeTo');
+
+        $currentTime = date('H:i:s', time());
+
+        // Không nhận request trong khoảng thời gian GHTK xử lý job đối soát tự động
+        if ($currentTime < $requestTimeFrom || $currentTime >= $requestTimeTo) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    public function checkCanAuditQuick() {
+        $lockModel = getInstance('TmpShopConfig');
+        $shopExtraModel = getInstance('RpDbShopsExtra');
+        $rpDbTSCModel = getInstance('RpDbTmpShopConfig');
+        $shopProfileModel = getInstance('RpDbShopProfile');
+
+        $shopWallet = $shopProfileModel->find('first', [
+            'fields' => ['wallet_active', 'wallet_id', 'wallet_enable'],
+            'conditions' => [
+                'shop_order' => AuthComponent::user('order')
+            ]
+        ]);
+
+        if (!empty($shopWallet['RpDbShopProfile']['wallet_active']) || !empty($shopWallet['RpDbShopProfile']['wallet_enable'])) {
+            $result = [
+                'success' => false,
+                'message' => 'Tính năng này hiện chưa áp dụng cho Shop. Vui lòng liên hệ CSKH để được hỗ trợ.'
+            ];
+
+            return $result;
+        }
+
+        $stopAuditQuick = $rpDbTSCModel->getListShopConfigByType(RpDbTmpShopConfig::TYPE_STOP_AUDIT_QUICK);
+        if (!empty($stopAuditQuick[0])) {
+            $result = [
+                'success' => false,
+                'message' => 'Tính năng này hiện đang bảo trì. GHTK xin lỗi Shop vì sự bất tiện này. Mong Shop thông cảm và thử lại sau nhé.'
+            ];
+
+            return $result;
+        }
+
+        // Check dừng đối soát ngày Lễ, Tết
+        $isHolidayStopAudit = $this->checkHolidayStopAudit();
+        if ($isHolidayStopAudit['stop']) {
+            $result = [
+                'success' => false,
+                'message' => $isHolidayStopAudit['message'],
+            ];
+
+            return $result;
+        }
+
+        // Check thời gian gửi request hợp lệ
+        $validTimeRequest = $this->checkValidTimeRequest();
+        if (!$validTimeRequest) {
+            $result = [
+                'success' => false,
+                'message' => 'GHTK đang trong quá trình xử lý đối soát. Shop vui lòng thử lại sau!'
+            ];
+
+            return $result;
+        }
+
+        // Kiểm tra shop có đang bị chặn rút CoD nhanh
+        $isSkipQuickCoD = $shopExtraModel->isSkipQuickCoD(AuthComponent::user('order'));
+        if ($isSkipQuickCoD) {
+            $result = [
+                'success' => false,
+                'message' => 'Shop đang bị chặn rút CoD nhanh!'
+            ];
+
+            return $result;
+        }
+
+        // Kiểm tra shop có đang bị tích giữ đối soát
+        $isHoldAudit = $shopExtraModel->isHoldAudit(AuthComponent::user('order'));
+        if ($isHoldAudit) {
+            $result = [
+                'success' => false,
+                'message' => 'Shop đang tạm thời bị giữ đối soát!'
+            ];
+
+            return $result;
+        }
+
+        // Kiểm tra shop có đang bị khóa đối soát nhanh
+        $isLockingAuditQuick = $lockModel->isLockingAuditQuick(AuthComponent::user('code'));
+        if ($isLockingAuditQuick) {
+            $result = [
+                'success' => false,
+                'message' => 'Shop đang trong quá trình đối soát. Vui lòng đợi!'
+            ];
+
+            return $result;
+        }
+
+        $rs = [
+            'success' => true,
+            'message' => '',
+        ];
+
+        return $rs;
+    }
+
+    /**
+     * Kiểm tra shop có được mở tính năng rút cod nhanh
+     */
+    public function checkAllowTransRealtime() {
+        $rpdbShopExtra = getInstance('RpDbShopsExtra');
+        getInstance('Shop');
+        $rpDbShop = getInstance('RpDbShop');
+        $shopAlias = $rpDbShop->alias;
+
+        // Check config đóng all tính năng rút cod nhanh
+        $stopQuickTransfer = Configure::read('TransferRealtime.stop');
+        if (!empty($stopQuickTransfer)) {
+            return false;
+        }
+
+        // Kiểm tra shop có đang bị chặn rút CoD nhanh
+        $isSkipQuickCoD = $rpdbShopExtra->isSkipQuickCoD(AuthComponent::user('order'));
+        if ($isSkipQuickCoD) {
+            return false;
+        }
+
+        // Check config mở all tính năng rút cod nhanh
+        $transferRealtimeALlShop = Configure::read('TransferRealtime.allShop');
+        if (!empty($transferRealtimeALlShop)) {
+            return true;
+        }
+
+        $shopCheckInfo = $rpDbShop->find('first', [
+            'fields' => [
+                'shop_type'
+            ],
+            'conditions' => [
+                'id' => AuthComponent::user('id')
+            ]
+        ]);
+
+        $shopType = !empty($shopCheckInfo[$shopAlias]['shop_type']) ? $shopCheckInfo[$shopAlias]['shop_type'] : '';
+        if (in_array($shopType, [Shop::$TYPE_PRO])) {
+            return true;
+        }
+
+        // Check Shop được tích đối soát nhanh
+        $configTransRealtime = $rpdbShopExtra->isQuickAudit(AuthComponent::user('order'));
+        if ($configTransRealtime) {
+            return true;
+        }
+
+        return false;
+    }
+
+    public function moneyCanAuditQuick() {
+        $shopModel = getInstance('RpDbShop');
+        $shopModel->alias = 'Shop';
+        $pkgModel = getInstance('RpDbPackage');
+        $pkgModel->alias = 'Package';
+        $debtBillModel = getInstance('RpDbDebtBill');
+        $prepayTransModel = getInstance('RpDbPrepaymentTransaction');
+        $issuesRefundAuditModel = getInstance('RpDbIssuesRefundAudit');
+        $billAuditQuickTransferModel = getInstance('RpDbBillAuditQuickTransfer');
+        $issuesPackageArrearsModel = getInstance('RpDbIssuesPackageArrears');
+
+        $shop = $shopModel->find('first', [
+            'fields' => [
+                'Shop.id', 'Shop.code', 'Shop.order',
+                'Shop.against_bank_own', 'Shop.against_bank_account', 'Bank.name',
+                'Shop.station_id', 'Shop.district_id', 'Shop.province_id',
+            ],
+            'joins' => [
+                [
+                    'table' => 'banks',
+                    'alias' => 'Bank',
+                    'type'  => 'LEFT',
+                    'conditions' => [
+                        'Shop.against_bank_name = Bank.code',
+                        'Bank.type = 1'
+                    ]
+                ]
+            ],
+            'conditions' => [
+                'Shop.code' => AuthComponent::user('code'),
+            ]
+        ]);
+
+        $bankInfo = [
+            'bank_own' => !empty($shop['Shop']['against_bank_own']) ? $shop['Shop']['against_bank_own'] : '',
+            'bank_account' => !empty($shop['Shop']['against_bank_account']) ? $shop['Shop']['against_bank_account'] : '',
+            'bank_name' => !empty($shop['Bank']['name']) ? $shop['Bank']['name'] : '',
+        ];
+
+        $conditionReturn = $this->Admin->getConditionReturn($shop['Shop']);
+
+        $packageWaitAudit = $pkgModel->find('all', [
+            'fields' => [
+                'Package.id', 'Package.order', 'Package.package_status_id',
+                'PackageMoney.cashback',
+                'SUM(COALESCE(PrepaymentTransaction.money, 0)) paid_other_fee_trans',
+            ],
+            'joins' => [
+                [
+                    'table' => 'package_moneys',
+                    'alias' => 'PackageMoney',
+                    'conditions' => [
+                        'PackageMoney.pkg_order = Package.order'
+                    ],
+                ],
+                [
+                    'table' => 'prepayment_transactions',
+                    'alias' => 'PrepaymentTransaction',
+                    'type' => 'LEFT',
+                    'conditions' => [
+                        'PrepaymentTransaction.pkg_order = Package.order',
+                        'PrepaymentTransaction.bill_type' => [
+                            'storeFeeTransaction', 'changeAddFeeTransaction',
+                            'returnFeeTransaction', 'shipFeeTransaction',
+                            'coFeeTransaction',
+                        ]
+                    ]
+                ],
+            ],
+            'conditions' => [
+                'Package.shop_id'     => AuthComponent::user('id'),
+                'Package.is_exported' => 0,
+                'Package.is_cancel'   => 0,
+                'OR'                  => $conditionReturn,
+                'NOT EXISTS (SELECT 1 FROM return_debt_moneys WHERE pkg_order = Package.order AND `status` != 3 AND is_cancel = 0)',
+            ],
+            'group' => 'Package.id',
+        ]);
+
+        $canAudit = false;
+        $currentCashback = 0;
+        $transferFee = Configure::read('TransferFee.Fee.Special');
+        $quickFee = Configure::read('QuickTransfer.Fee.Quick');
+        $packageCanAuditQuick = [];
+
+        $minAuditMoney = Configure::read('QuickTransfer.Audit.MinMoney');
+        $maxAuditMoney = Configure::read('QuickTransfer.Audit.MaxMoney');
+        $maxAuditMoneyInDay = Configure::read('QuickTransfer.Audit.MaxMoneyInDay');
+
+        if (!empty($packageWaitAudit)) {
+            // Tổng tiền đã đối soát nhanh trong ngày
+            $totalMoneyTransferInDay = $billAuditQuickTransferModel->find('first', [
+                'fields' => [
+                    'SUM(cashback) total_money'
+                ],
+                'conditions' => [
+                    'shop_code' => $shop['Shop']['code'],
+                    'created >=' => date('Y-m-d'),
+                    'created <=' => date('Y-m-d 23:59:59'),
+                ]
+            ]);
+
+            $totalMoneyTransferInDay = !empty($totalMoneyTransferInDay[0]['total_money']) ? $totalMoneyTransferInDay[0]['total_money'] : 0;
+
+            $totalDebt = $debtBillModel->getCurrentDebtMoney($shop['Shop']['order']);
+            $totalPrepayment = $prepayTransModel->getCurrentPrepayTransMoney($shop['Shop']['code']);
+            $totalRefundAudit = $issuesRefundAuditModel->getCurrentRefundAuditMoney($shop['Shop']['code']);
+            $totalArrearsMoney = $issuesPackageArrearsModel->getCurrentArrearsMoney($shop['Shop']['code']);
+
+            $currentCashback = $totalRefundAudit - $totalDebt - $totalPrepayment - $totalArrearsMoney;
+
+            // Tính tiền đơn không giao được (9,11) trước
+            $packageWaitAudit = Hash::sort($packageWaitAudit, '{n}.Package.package_status_id', 'desc');
+            foreach ($packageWaitAudit as $pkg) {
+                // Tiền chuyển dự tính
+                $tmpCashback = $currentCashback + $pkg['PackageMoney']['cashback'] + $pkg[0]['paid_other_fee_trans'];
+                $totalMoneyTransferInDay += $pkg['PackageMoney']['cashback'] + $pkg[0]['paid_other_fee_trans'];
+
+                if ($tmpCashback > $maxAuditMoney || $totalMoneyTransferInDay > $maxAuditMoneyInDay) break;
+
+                $currentCashback = $tmpCashback;
+                $packageCanAuditQuick[] = $pkg['Package']['id'];
+            }
+
+            if (!empty($packageCanAuditQuick)
+                && ($currentCashback - $transferFee - $quickFee) >= $minAuditMoney
+                && $currentCashback <= $maxAuditMoney
+            ) {
+                $canAudit = true;
+            }
+        }
+
+        $data = [
+            'bank_info'    => $bankInfo,
+            'canAudit'     => $canAudit,
+            'cashback'     => (int) $currentCashback,
+            'transfer_fee' => (int) $transferFee,
+            'quick_fee'    => (int) $quickFee,
+            'count_pkg'    => count($packageCanAuditQuick),
+            'packages'     => $packageCanAuditQuick,
+        ];
+
+        return $data;
+    }
+
+    public function validateAuditQuickTransfer($data) {
+        $baqtModel = getInstance('BillAuditQuickTransfer');
+        $subModel = getInstance('TmpShopUpdateBank');
+
+        $shopInfo = $data['shop'];
+
+        if (empty($shopInfo)) {
+            $rs = [
+                'success' => false,
+                'message' => 'Dữ liệu shop không hợp lệ. Vui lòng thử lại!'
+            ];
+
+            return $rs;
+        }
+
+        // Kiểm tra shop đủ điều kiện đối soát nhanh
+        $validQuickTransfer = $this->checkCanAuditQuick();
+        if (empty($validQuickTransfer['success'])) {
+            return $validQuickTransfer;
+        }
+
+        // Kiểm tra shop sửa thông tin ngân hàng chưa được CS xác nhận
+        $isSkipAudit = $subModel->isSkipAudit($shopInfo['Shop']['order']);
+        if ($isSkipAudit) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tính năng rút CoD nhanh sẽ tạm dừng kể từ khi đổi thông tin Tài khoản ngân hàng. GHTK sẽ liên hệ với shop để xác minh thông tin.'
+            ];
+
+            return $rs;
+        }
+
+        // Kiểm tra tài khoản ngân hàng có hợp lệ
+        $validBankAcc = $this->validBankAcc($shopInfo, 1);
+        if (!$validBankAcc['success']) {
+            return $validBankAcc;
+        }
+
+        // Kiểm tra đã hết hạn mức rút tiền CoD nhanh chuyển khoản 1 ngày
+        $isMaxCashback = $baqtModel->checkMaxCashbackInDay();
+        if ($isMaxCashback) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tính năng tạm dừng hoạt động. Shop vui lòng thử lại sau!'
+            ];
+
+            return $rs;
+        }
+
+        $rs = [
+            'success' => true,
+            'message' => '',
+        ];
+
+        return $rs;
+    }
+
+    public function prepareAuditQuick($data) {
+        $lockModel = getInstance('TmpShopConfig');
+        $shopModel = getInstance('Shop');
+        $pkgModel = getInstance('Package');
+
+        $shopInfo = $data['shop'];
+
+        // Update phí trả của đơn hàng trước khi đối soát
+        $this->Returns->checkUpdateReturnFee($shopInfo['Shop']['id']);
+
+        $conditionReturn = $this->Admin->getConditionReturn($shopInfo['Shop']);
+        $packageWaitAudit = $pkgModel->find('all', [
+            'fields' => [
+                'id', 'alias', 'package_status_id', 'ship_money', 'pick_money', 'shop_code', 'shop_id',
+                'is_freeship', 'pre_paid_amount', 'co_check_fee', 'return_fee', 'insurance', 'store_fee',
+                'return_part_package', 'order',
+            ],
+            'conditions' => [
+                'Package.id'          => $data['package_ids'],
+                'Package.shop_id'     => $shopInfo['Shop']['id'],
+                'Package.is_exported' => 0,
+                'Package.is_cancel'   => 0,
+                'OR'                  => $conditionReturn,
+                'NOT EXISTS (SELECT 1 FROM return_debt_moneys WHERE pkg_order = Package.order AND `status` != 3 AND is_cancel = 0)',
+            ]
+        ]);
+
+        if (empty($packageWaitAudit)) {
+            $rs = [
+                'success' => false,
+                'message' => 'Không tìm thấy đơn hàng hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        $audit = [
+            'Shop' => $shopInfo['Shop'],
+            'Package' => [],
+        ];
+
+        foreach ($packageWaitAudit as $pkg) {
+            $audit['Package'][] = $pkg['Package'];
+        }
+
+        $maxTime = date('Y-m-d H:i:s');
+        // Check đơn bồi hoàn
+        $this->Audit->checkRefundMoney($audit, $maxTime);
+
+        $audits = [$audit];
+        $tmpDebtBill = [];
+        $this->Audit->checkAllMoneyPrepareAudit($audits, $tmpDebtBill, $maxTime);
+        $cashback = $audits[0]['revenue']['done']['total_cash_back'] + $audits[0]['revenue']['done']['transfer_fee'];
+        $transferFee = $audits[0]['revenue']['done']['transfer_fee'];
+        $quickFee = Configure::read('QuickTransfer.Fee.Quick');
+
+        $minAuditMoney = Configure::read('QuickTransfer.Audit.MinMoney');
+        $maxAuditMoney = Configure::read('QuickTransfer.Audit.MaxMoney');
+
+        if (($cashback - $transferFee - $quickFee) < $minAuditMoney || $cashback > $maxAuditMoney) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tiền rút CoD nhanh không hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        $packageIds = hash::extract($audit['Package'], '{n}.id');
+        $prepayTransId = hash::extract($audits[0]['PrepaymentTransaction'], '{n}.id');
+        $refundAuditId = hash::extract($audits[0]['RefundAudit'], '{n}.id');
+        $cashAdvanceTransId = hash::extract($audits[0]['CashAdvanceTransaction'], '{n}.id');
+        $arrearsId = hash::extract($audits[0]['IssuesPackageArrears'], '{n}.id');
+
+        $updateAuditing = $this->Audit->newAuditPackages($audit['Shop']['id'], $packageIds, $prepayTransId, $refundAuditId, $cashAdvanceTransId, $arrearsId);
+
+        if ($updateAuditing === true) {
+            try {
+                $lockAudit = $lockModel->lockAuditQuick($audit['Shop']['code']);
+                if ($lockAudit) {
+                    $isLocked = true;
+                } else {
+                    $isLocked = false;
+                }
+            } catch (Exception $e) {
+                $isLocked = false;
+            }
+
+            if (!empty($isLocked)) {
+                CakeResque::enqueue(Configure::read('Resque.queue.audit'), 'UtilsShell', array('runJob', 'auditQuickTransfer', $audit['Shop']['code']));
+
+                $rs = [
+                    'success' => true,
+                    'message' => 'Yêu cầu rút CoD nhanh đang được xử lý. Shop vui lòng đợi trong giây lát!'
+                ];
+            } else {
+                $rs = [
+                    'success' => false,
+                    'message' => 'Yêu cầu rút CoD nhanh không thành công. Shop vui lòng thử lại sau!'
+                ];
+            }
+
+            return $rs;
+        } else {
+            $rs = [
+                'success' => false,
+                'message' => 'Yêu cầu rút CoD nhanh không thành công. Shop vui lòng thử lại sau!'
+            ];
+
+            return $rs;
+        }
+    }
+
+    public function checkSkipAudit($date) {
+        $auditConfigModel = getInstance('RpDbAuditConfig');
+        //Skip audit date from - to
+        list($skipDateFrom, $skipDateTo) = $auditConfigModel->getSkipAuditConfigs();
+
+        if (empty($skipDateFrom) || empty($skipDateTo)) {
+            $skipAudit = false;
+        } else {
+            // Đóng đối soát nếu ngày chạy nằm trong config
+            if ($date >= $skipDateFrom && $date <= $skipDateTo) {
+                $skipAudit = true;
+            } else {
+                $skipAudit = false;
+            }
+        }
+
+        return $skipAudit;
+    }
+
+    public function checkHolidayStopAudit() {
+        $date = date('Y-m-d');
+
+        // Config ngày đối soát đặc biệt
+        $currentTime = date('H:i:s', time());
+        $forceAudit = Configure::read('Audit.ForceAudit.Date');
+        if ($date == $forceAudit && $currentTime <= '17:00:00') {
+            $rs = [
+                'stop' => false,
+                'message' => ''
+            ];
+
+            return $rs;
+        }
+
+        // Check ngày dừng đối soát theo config
+        $skipAudit = $this->checkSkipAudit($date);
+        if ($skipAudit) {
+            $rs = [
+                'stop' => true,
+                'message' => 'Tính năng rút tiền CoD nhanh không thực hiện được vào các ngày Lễ, Tết. Shop vui lòng thử lại sau!'
+            ];
+        } else {
+            $rs = [
+                'stop' => false,
+                'message' => ''
+            ];
+        }
+
+        return $rs;
+    }
+
+    public function validShopAuditCash() {
+        $shopExtraModel = getInstance('RpDbShopsExtra');
+
+        // Check shop được mở tính năng yêu cầu ứng tiền hàng
+        $configAuditCash = $shopExtraModel->isAuditCash(AuthComponent::user('order'));
+        if (empty($configAuditCash)) {
+            $result = [
+                'success' => false,
+                'message' => 'Tính năng yêu cầu không hợp lệ!'
+            ];
+
+            return $result;
+        }
+
+        // Kiểm tra shop đủ điều kiện đối soát nhanh
+        $validQuickTransfer = $this->checkCanAuditQuick();
+        if (empty($validQuickTransfer['success'])) {
+            return $validQuickTransfer;
+        }
+
+        $result = [
+            'success' => true,
+            'message' => '',
+        ];
+
+        return $result;
+    }
+
+    public function prepareAuditCash($data) {
+        $lockModel = getInstance('TmpShopConfig');
+        $pkgModel = getInstance('Package');
+
+        $shopInfo = $data['shop'];
+
+        // Update phí trả của đơn hàng trước khi đối soát
+        $this->Returns->checkUpdateReturnFee(AuthComponent::user('id'));
+
+        $conditionReturn = $this->Admin->getConditionReturn($shopInfo['Shop']);
+        $packageWaitAudit = $pkgModel->find('all', [
+            'fields' => [
+                'id', 'alias', 'package_status_id', 'ship_money', 'pick_money', 'shop_code', 'shop_id',
+                'is_freeship', 'pre_paid_amount', 'co_check_fee', 'return_fee', 'insurance', 'store_fee',
+                'return_part_package', 'order',
+            ],
+            'conditions' => [
+                'Package.shop_id'     => AuthComponent::user('id'),
+                'Package.is_exported' => 0,
+                'Package.is_cancel'   => 0,
+                'OR'                  => $conditionReturn,
+                'NOT EXISTS (SELECT 1 FROM return_debt_moneys WHERE pkg_order = Package.order AND `status` != 3 AND is_cancel = 0)',
+            ]
+        ]);
+
+        if (empty($packageWaitAudit)) {
+            $rs = [
+                'success' => false,
+                'message' => 'Không tìm thấy đơn hàng hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        $audit = [
+            'Shop' => $shopInfo['Shop'],
+            'Package' => [],
+        ];
+
+        foreach ($packageWaitAudit as $pkg) {
+            $audit['Package'][] = $pkg['Package'];
+        }
+
+        $maxTime = date('Y-m-d H:i:s');
+        // Check đơn bồi hoàn
+        $this->Audit->checkRefundMoney($audit, $maxTime);
+
+        $audits = [$audit];
+        $tmpDebtBill = [];
+        $this->Audit->checkAllMoneyPrepareAudit($audits, $tmpDebtBill, $maxTime);
+
+        $minAuditMoney = Configure::read('QuickTransfer.Audit.MinMoney');
+        $maxAuditMoney = Configure::read('QuickTransfer.Audit.MaxMoney');
+
+        // Tính phí ứng tiền hàng + Tiền trả shop
+        $cashback = $audits[0]['revenue']['done']['total_cash_back'] + $audits[0]['revenue']['done']['transfer_fee'];
+        $quickFee = Configure::read('QuickTransfer.Fee.Quick');
+        // Phí ứng tiền hàng
+        $totalCashFee = ceil($cashback / $maxAuditMoney) * $quickFee;
+        // Tiền trả shop (Không bao gồm phí chuyển khoản)
+        $fnCashback = $cashback - $totalCashFee;
+
+        if ($fnCashback < $minAuditMoney) {
+            $rs = [
+                'success' => false,
+                'message' => 'Tiền đối soát không hợp lệ!'
+            ];
+
+            return $rs;
+        }
+
+        $packageIds = hash::extract($audit['Package'], '{n}.id');
+        $prepayTransId = hash::extract($audits[0]['PrepaymentTransaction'], '{n}.id');
+        $refundAuditId = hash::extract($audits[0]['RefundAudit'], '{n}.id');
+        $cashAdvanceTransId = hash::extract($audits[0]['CashAdvanceTransaction'], '{n}.id');
+        $arrearsId = hash::extract($audits[0]['IssuesPackageArrears'], '{n}.id');
+
+        $updateAuditing = $this->Audit->newAuditPackages($audit['Shop']['id'], $packageIds, $prepayTransId, $refundAuditId, $cashAdvanceTransId, $arrearsId);
+
+        if ($updateAuditing === true) {
+            try {
+                $lockAudit = $lockModel->lockAuditQuick($audit['Shop']['code']);
+                if ($lockAudit) {
+                    $isLocked = true;
+                } else {
+                    $isLocked = false;
+                }
+            } catch (Exception $e) {
+                $isLocked = false;
+            }
+
+            if (!empty($isLocked)) {
+                CakeResque::enqueue(Configure::read('Resque.queue.audit'), 'AuditShell', array('runJob', 'auditShopCash', $audit['Shop']['code'], $data['station_id']));
+
+                $deadLineTime = $this->ErpAuditBill->getDeadline();
+
+                $rs = [
+                    'success' => true,
+                    'message' => 'Yêu cầu thành công!',
+                    'data'    => [
+                        'fn_cashback' => $fnCashback,
+                        'dead_line'   => $deadLineTime,
+                    ]
+                ];
+            } else {
+                $rs = [
+                    'success' => false,
+                    'message' => 'Yêu cầu không thành công. Vui lòng thử lại!',
+                    'data'    => []
+                ];
+            }
+
+            return $rs;
+        } else {
+            $rs = [
+                'success' => false,
+                'message' => 'Yêu cầu không thành công. Vui lòng thử lại!',
+                'data'    => []
+            ];
+
+            return $rs;
+        }
+    }
+}
